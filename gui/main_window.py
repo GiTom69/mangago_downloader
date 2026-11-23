@@ -595,11 +595,13 @@ class MainWindow(QMainWindow):
         format_type = self.download_config.get("format", "images")
         if format_type != "images" and successful and self.current_manga:
             delete_images = self.download_config.get("delete_images", False)
+            downloaded_chapter_dirs = [r.file_path for r in successful if r.file_path]
             self.conversion_controller.convert_chapters(
                 self.current_manga,
                 format_type,
                 delete_images,
-                self.download_config
+                self.download_config,
+                chapter_dirs=downloaded_chapter_dirs,
             )
     
     def _on_download_status_updated(self, status: str):

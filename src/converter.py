@@ -2,12 +2,42 @@
 Conversion functionality for the Mangago Downloader.
 Supports converting downloaded manga images to PDF and CBZ formats.
 """
+import io
 import os
 import zipfile
-from pathlib import Path
 from typing import List, Optional
 import img2pdf
 from PIL import Image
+
+
+def _normalize_image_for_pdf(image_path: str) -> bytes:
+    """
+    Prepare PDF-compatible image bytes in memory without modifying files on disk.
+    Keeps plain RGB/grayscale JPEGs lossless without re-encoding, and normalizes
+    WEBP, alpha-channel (RGBA/LA/PA), palette (P), or other modes to RGB PNG.
+    """
+    use_raw = False
+    buf = io.BytesIO()
+    with Image.open(image_path) as img:
+        has_transparency = "transparency" in img.info
+        if img.format == "JPEG" and img.mode in ("RGB", "L") and not has_transparency:
+            use_raw = True
+        else:
+            if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and has_transparency):
+                rgba = img.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                rgb_img = background
+            elif img.mode != "RGB":
+                rgb_img = img.convert("RGB")
+            else:
+                rgb_img = img
+            rgb_img.save(buf, format="PNG")
+
+    if use_raw:
+        with open(image_path, "rb") as raw_f:
+            return raw_f.read()
+    return buf.getvalue()
 
 
 def convert_to_pdf(
@@ -16,7 +46,9 @@ def convert_to_pdf(
     delete_images: bool = False
 ) -> Optional[str]:
     """
-    Convert chapter images to a high-quality PDF without re-encoding.
+    Convert chapter images to a high-quality PDF without re-encoding when possible,
+    falling back to in-memory RGB normalization for WEBP/alpha/palette images
+    rejected by img2pdf.
     """
     try:
         image_files = _get_image_files(chapter_dir)
@@ -28,9 +60,17 @@ def convert_to_pdf(
             chapter_name = os.path.basename(os.path.normpath(chapter_dir))
             output_path = os.path.join(chapter_dir, f"{chapter_name}.pdf")
         
-        # Pass file paths directly so img2pdf manages file handles cleanly without re-encoding.
+        # Fast lossless path: pass file paths directly so img2pdf manages file handles
+        # without re-encoding. Fall back to in-memory PIL normalization when img2pdf
+        # rejects WEBP/alpha/palette images.
+        try:
+            pdf_bytes = img2pdf.convert(image_files)
+        except Exception:
+            normalized_images = [_normalize_image_for_pdf(path) for path in image_files]
+            pdf_bytes = img2pdf.convert(normalized_images)
+
         with open(output_path, "wb") as f:
-            f.write(img2pdf.convert(image_files))
+            f.write(pdf_bytes)
         
         if delete_images:
             for image_file in image_files:
@@ -145,11 +185,12 @@ def convert_manga_chapters(
 
 def _image_sort_key(filepath: str):
     """Sort key that orders numeric stems numerically, with non-numeric stems after."""
-    stem = os.path.splitext(os.path.basename(filepath))[0]
+    basename = os.path.basename(filepath)
+    stem = os.path.splitext(basename)[0]
     try:
-        return (0, int(stem), stem)
+        return (0, int(stem), basename)
     except ValueError:
-        return (1, 0, stem)
+        return (1, 0, basename)
 
 
 def _get_image_files(directory: str) -> List[str]:

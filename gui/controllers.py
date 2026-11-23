@@ -5,6 +5,7 @@ These controllers handle all business logic without modifying the core applicati
 
 import os
 import sys
+import threading
 from typing import List, Optional, Tuple
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer
 from PyQt6.QtWidgets import QApplication
@@ -13,10 +14,25 @@ from PyQt6.QtWidgets import QApplication
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.search import search_manga, get_manga_details
-from src.downloader import ChapterDownloader, fetch_chapter_image_urls, get_chapter_list, close_driver
+from src.downloader import (
+    ChapterDownloader,
+    fetch_chapter_image_urls,
+    fetch_chapters_image_urls,
+    get_chapter_list,
+    close_driver,
+)
 from src.converter import convert_manga_chapters
 from src.models import Manga, Chapter, SearchResult, DownloadResult
 from src.utils import sanitize_filename
+
+
+def _format_error(error: object) -> str:
+    """Return a concise single-line error message for GUI status displays."""
+    text = str(error).strip()
+    if not text:
+        return type(error).__name__ if isinstance(error, BaseException) else "Unknown error"
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return first_line or text
 
 
 class SearchWorker(QThread):
@@ -78,26 +94,41 @@ class ChapterListWorker(QThread):
 
 
 class ImageUrlsWorker(QThread):
-    """Worker thread for fetching chapter image URLs."""
+    """Worker thread for fetching chapter image URLs using reused WebDrivers."""
     
     urls_completed = pyqtSignal(object, list)  # Chapter, List[str]
     urls_failed = pyqtSignal(object, str)  # Chapter, Error message
     progress_updated = pyqtSignal(int)  # Progress value
     
-    def __init__(self, chapters: List[Chapter]):
+    def __init__(self, chapters: List[Chapter], max_workers: int = 2):
         super().__init__()
         self.chapters = chapters
+        self.max_workers = max(1, min(max_workers, 2))
     
     def run(self):
-        for i, chapter in enumerate(self.chapters):
-            try:
-                image_urls = fetch_chapter_image_urls(chapter.url)
-                chapter.image_urls = image_urls
-                self.urls_completed.emit(chapter, image_urls)
-            except Exception as e:
-                self.urls_failed.emit(chapter, str(e))
-            
-            self.progress_updated.emit(i + 1)
+        if not self.chapters:
+            return
+
+        completed_count = 0
+        lock = threading.Lock()
+
+        def on_chapter_complete(chapter: Chapter, error: Optional[Exception]) -> None:
+            nonlocal completed_count
+            if error is not None:
+                self.urls_failed.emit(chapter, _format_error(error))
+            else:
+                self.urls_completed.emit(chapter, chapter.image_urls)
+
+            with lock:
+                completed_count += 1
+                current = completed_count
+            self.progress_updated.emit(current)
+
+        fetch_chapters_image_urls(
+            self.chapters,
+            max_workers=self.max_workers,
+            on_chapter_complete=on_chapter_complete,
+        )
 
 
 class DownloadWorker(QThread):
@@ -147,11 +178,18 @@ class ConversionWorker(QThread):
     progress_updated = pyqtSignal(int)  # Progress value
     status_updated = pyqtSignal(str)  # Status message
     
-    def __init__(self, manga_dir: str, format_type: str, delete_images: bool = False):
+    def __init__(
+        self,
+        manga_dir: str,
+        format_type: str,
+        delete_images: bool = False,
+        chapter_dirs: Optional[List[str]] = None,
+    ):
         super().__init__()
         self.manga_dir = manga_dir
         self.format_type = format_type
         self.delete_images = delete_images
+        self.chapter_dirs = chapter_dirs
     
     def run(self):
         try:
@@ -159,11 +197,12 @@ class ConversionWorker(QThread):
             created_files = convert_manga_chapters(
                 self.manga_dir, 
                 self.format_type, 
-                self.delete_images
+                self.delete_images,
+                chapter_dirs=self.chapter_dirs,
             )
             self.conversion_completed.emit(created_files)
         except Exception as e:
-            self.conversion_failed.emit(str(e))
+            self.conversion_failed.emit(_format_error(e))
 
 
 class SearchController(QObject):
@@ -259,7 +298,7 @@ class DownloadController(QObject):
     def _fetch_image_urls(self, chapters: List[Chapter], manga: Manga, max_workers: int, download_config: Optional[dict] = None):
         """Fetch image URLs for chapters."""
         self.status_updated.emit("Fetching image URLs...")
-        self.urls_worker = ImageUrlsWorker(chapters)
+        self.urls_worker = ImageUrlsWorker(chapters, max_workers=min(max_workers, 2))
         self.urls_worker.urls_completed.connect(self._on_urls_completed)
         self.urls_worker.urls_failed.connect(self._on_urls_failed)
         self.urls_worker.progress_updated.connect(
@@ -331,7 +370,14 @@ class ConversionController(QObject):
         super().__init__()
         self.worker = None
     
-    def convert_chapters(self, manga: Manga, format_type: str, delete_images: bool = False, download_config: Optional[dict] = None):
+    def convert_chapters(
+        self,
+        manga: Manga,
+        format_type: str,
+        delete_images: bool = False,
+        download_config: Optional[dict] = None,
+        chapter_dirs: Optional[List[str]] = None,
+    ):
         """Convert downloaded chapters to specified format."""
         if self.worker and self.worker.isRunning():
             return
@@ -344,7 +390,7 @@ class ConversionController(QObject):
         manga_dir = os.path.join(download_dir, sanitize_filename(manga.title))
         
         self.conversion_started.emit()
-        self.worker = ConversionWorker(manga_dir, format_type, delete_images)
+        self.worker = ConversionWorker(manga_dir, format_type, delete_images, chapter_dirs=chapter_dirs)
         self.worker.conversion_completed.connect(self.conversion_completed.emit)
         self.worker.conversion_failed.connect(self.conversion_failed.emit)
         self.worker.progress_updated.connect(self.progress_updated.emit)

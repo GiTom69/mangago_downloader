@@ -9,20 +9,29 @@ from rich.prompt import Prompt, Confirm, IntPrompt
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 import sys
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Add src to path so we can import our modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from urllib.parse import urlparse # Add this import
 from src.search import search_manga, get_manga_details
-from src.downloader import ChapterDownloader, fetch_chapter_image_urls, get_chapter_list, close_driver
+from src.downloader import ChapterDownloader, fetch_chapters_image_urls, get_chapter_list, close_driver
 from src.converter import convert_manga_chapters
 from src.models import Manga, Chapter, SearchResult
 from src.utils import sanitize_filename
 
 app = typer.Typer()
 console = Console()
+
+
+def _format_error(error: object) -> str:
+    """Return a concise single-line error message (avoids huge Selenium stacktraces)."""
+    text = str(error).strip()
+    if not text:
+        return type(error).__name__ if isinstance(error, BaseException) else "Unknown error"
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return first_line or text
 
 
 @app.command()
@@ -169,26 +178,37 @@ def main():
             if format_choice != "none":
                 delete_images = Confirm.ask("[bold green]Delete images after conversion?[/bold green]", default=False)
 
+            progress_lock = threading.Lock()
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), console=console) as progress:
                 task = progress.add_task("[cyan]Fetching image URLs...", total=len(selected_chapters))
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    future_to_chapter = {executor.submit(fetch_chapter_image_urls, chapter.url): chapter for chapter in selected_chapters}
-                    for future in as_completed(future_to_chapter):
-                        chapter = future_to_chapter[future]
-                        try:
-                            chapter.image_urls = future.result()
-                            console.print(f"  [green]Found {len(chapter.image_urls)} images for Chapter {chapter.number}.[/green]")
-                        except Exception as e:
-                            console.print(f"  [red]Error fetching URLs for Chapter {chapter.number}: {e}[/red]")
+
+                def on_chapter_complete(chapter: Chapter, error: Optional[Exception]) -> None:
+                    with progress_lock:
+                        if error is not None:
+                            console.print(
+                                f"  [red]Error fetching URLs for Chapter {chapter.number}: {_format_error(error)}[/red]"
+                            )
+                        else:
+                            console.print(
+                                f"  [green]Found {len(chapter.image_urls)} images for Chapter {chapter.number}.[/green]"
+                            )
                         progress.update(task, advance=1)
+
+                fetch_chapters_image_urls(
+                    selected_chapters,
+                    max_workers=2,
+                    on_chapter_complete=on_chapter_complete,
+                )
 
             console.print(f"\n[bold blue]Downloading {len(selected_chapters)} chapters...[/bold blue]")
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TaskProgressColumn(), console=console) as progress:
                 task = progress.add_task("[cyan]Downloading chapters...", total=len(selected_chapters))
                 
                 downloader = ChapterDownloader(max_workers=10)
-                results = downloader.download_chapters(manga, selected_chapters)
-                downloader.close()
+                try:
+                    results = downloader.download_chapters(manga, selected_chapters)
+                finally:
+                    downloader.close()
                 
                 progress.update(task, completed=len(results))
                 
@@ -199,7 +219,7 @@ def main():
                 if failed:
                     console.print(f"[yellow]Failed to download {len(failed)} chapters[/yellow]")
                     for res in failed:
-                        console.print(f"[red]  - Chapter {res.chapter.number}: {res.error_message}[/red]")
+                        console.print(f"[red]  - Chapter {res.chapter.number}: {_format_error(res.error_message)}[/red]")
             
             if format_choice in ["pdf", "cbz"] and successful:
                 downloaded_chapter_dirs = [r.file_path for r in successful if r.file_path]
@@ -218,7 +238,7 @@ def main():
                 console.print("\n[bold blue]Skipping conversion. Images saved.[/bold blue]")
 
         except Exception as e:
-            console.print(f"[bold red]An unexpected error occurred: {e}[/bold red]")
+            console.print(f"[bold red]An unexpected error occurred: {_format_error(e)}[/bold red]")
         finally:
             if driver:
                 close_driver(driver)

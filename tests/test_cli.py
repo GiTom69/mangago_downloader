@@ -150,12 +150,20 @@ class TestMainCLI(unittest.TestCase):
         mock_downloader = MagicMock()
         mock_downloader.download_chapters.return_value = dl_results
         mock_convert = MagicMock(return_value=["downloads/Test Manga/Chapter_1/Chapter_1.pdf"])
+        fetch_calls = []
+
+        def fake_fetch_batch(ch_list, max_workers=2, on_chapter_complete=None):
+            fetch_calls.append((list(ch_list), max_workers))
+            for ch in ch_list:
+                ch.image_urls = ["https://img/1.jpg"]
+                if on_chapter_complete:
+                    on_chapter_complete(ch, None)
 
         with (
             patch.object(main_cli, "get_manga_details", return_value=(manga, MagicMock())),
             patch.object(main_cli, "get_chapter_list", return_value=chapters),
             patch.object(main_cli, "close_driver"),
-            patch.object(main_cli, "fetch_chapter_image_urls", return_value=["https://img/1.jpg"]),
+            patch.object(main_cli, "fetch_chapters_image_urls", side_effect=fake_fetch_batch),
             patch.object(main_cli, "ChapterDownloader", return_value=mock_downloader),
             patch.object(main_cli, "convert_manga_chapters", mock_convert),
             patch.object(main_cli.Prompt, "ask", side_effect=lambda *a, **k: next(prompt_answers)),
@@ -165,9 +173,78 @@ class TestMainCLI(unittest.TestCase):
         ):
             main_cli.main()
 
+        self.assertEqual(len(fetch_calls), 1)
+        self.assertEqual(fetch_calls[0][0], chapters[0:2])
+        self.assertEqual(fetch_calls[0][1], 2)
+        mock_downloader.close.assert_called_once()
         mock_convert.assert_called_once()
         _, kwargs = mock_convert.call_args
         self.assertEqual(kwargs.get("chapter_dirs"), ["downloads/Test Manga/Chapter_1"])
+
+    def test_format_error_collapses_multiline_selenium_stacktrace(self):
+        selenium_err = RuntimeError(
+            "Message: timeout: Timed out receiving message from renderer: 30.000\n"
+            "Stacktrace:\n"
+            "\tGetHandleVerifier [0x00007FF6]\n"
+            "\t(No symbol) [0x00007FF6]\n"
+        )
+        formatted = main_cli._format_error(selenium_err)
+        self.assertEqual(
+            formatted,
+            "Message: timeout: Timed out receiving message from renderer: 30.000",
+        )
+        self.assertNotIn("Stacktrace", formatted)
+        self.assertNotIn("\n", formatted)
+
+        self.assertEqual(main_cli._format_error(ValueError("")), "ValueError")
+        self.assertEqual(main_cli._format_error("  \nfirst line\nsecond line"), "first line")
+
+    def test_cli_prints_concise_error_from_fetch_chapters_callback(self):
+        manga, chapters = self._sample_manga_and_chapters()
+        prompt_answers = iter(["2", manga.url, "3", "none"])
+        int_answers = iter([1])
+        confirm_answers = iter([False])
+
+        dl_results = [
+            DownloadResult(
+                chapter=chapters[0],
+                success=False,
+                file_path="downloads/Test Manga/Chapter_1",
+                error_message="Failed\nStacktrace:\n\tline2",
+                images_downloaded=0,
+            ),
+        ]
+        mock_downloader = MagicMock()
+        mock_downloader.download_chapters.return_value = dl_results
+        printed = []
+
+        def fake_fetch_batch(ch_list, max_workers=2, on_chapter_complete=None):
+            err = RuntimeError("Message: renderer timeout\nStacktrace:\n\t0xDEADBEEF")
+            if on_chapter_complete:
+                on_chapter_complete(ch_list[0], err)
+
+        with (
+            patch.object(main_cli, "get_manga_details", return_value=(manga, MagicMock())),
+            patch.object(main_cli, "get_chapter_list", return_value=chapters),
+            patch.object(main_cli, "close_driver"),
+            patch.object(main_cli, "fetch_chapters_image_urls", side_effect=fake_fetch_batch),
+            patch.object(main_cli, "ChapterDownloader", return_value=mock_downloader),
+            patch.object(main_cli.Prompt, "ask", side_effect=lambda *a, **k: next(prompt_answers)),
+            patch.object(main_cli.IntPrompt, "ask", side_effect=lambda *a, **k: next(int_answers)),
+            patch.object(main_cli.Confirm, "ask", side_effect=lambda *a, **k: next(confirm_answers)),
+            patch.object(
+                main_cli.console,
+                "print",
+                side_effect=lambda *a, **k: printed.append(" ".join(str(x) for x in a)),
+            ),
+        ):
+            main_cli.main()
+
+        combined = "\n".join(printed)
+        self.assertIn("Message: renderer timeout", combined)
+        self.assertNotIn("Stacktrace", combined)
+        self.assertNotIn("0xDEADBEEF", combined)
+        mock_downloader.close.assert_called_once()
 
 
 if __name__ == "__main__":
